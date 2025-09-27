@@ -35,7 +35,7 @@ from aiogram.fsm.context import FSMContext
 API_TOKEN = "7655638672:AAFOopE1OW8vdWsXD7vkWCT6ajwG5EteD8Y"
 CRYPTOBOT_TOKEN = "465711:AAarYlqovxpBZzKvON1MBg5Vx967hLO7AyW"
 ADMIN_IDS = [7550144201]
-PAYMENT_GROUP_ID = -1002469741253  # группа/канал для чеков и репортов
+PAYMENT_GROUP_ID = -1003167574208  # группа/канал для чеков и репортов
 
 # --- Логи ---
 logging.basicConfig(level=logging.INFO)
