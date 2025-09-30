@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Telegram bot (aiogram v3.7) — чистая сборка с проверкой синтаксиса.
+Telegram bot (aiogram v3.7) — обновлённая сборка под ваши правки.
 
-Сделано по вашим требованиям:
-- Меню: 👥 Рефералы + ℹ️ «Поддержка - @HarikCVV»
-- Реферальная система: баланс 0.0 по умолчанию, начисление 10% при оплате
-- Админка: «Выдать тариф» и «Изменить карту» через state.set_state(...)
-- Оплата картой: «📎 После оплаты отправьте чек оплаты @HarikCVV»
-- «💀 Снести Жертву» с прогресс-баром (без вреда — это репорт админам)
-- Токены и ID оставлены в коде
+Правки по задаче:
+- Профиль: красивое форматирование, убраны «Баланс» и «Вайтлист»,
+  вместо «Реферал» — «Количество рефералов».
+- Информация: добавлены поддержка и отзывы — @HarikCVV и @RepHarik.
+- Админка: убраны кнопки «Баланс пользователя» и «Выдать тариф»,
+  добавлена кнопка «📊 Статистика (PDF)» — бот отдаёт PDF,
+  где сначала пользователи с активной подпиской, затем остальные.
+- Выдача тарифа остаётся по команде /grant <user_id> <days>.
+- Токены и ID оставлены без изменений.
 
-Важно: Любые вредоносные действия НЕ реализованы. «Снести» — это жалоба админам.
+PDF формируется через fpdf2 (если есть) или через reportlab. Если их нет —
+бот подскажет, что установить.
 """
 
 import logging
@@ -18,20 +21,20 @@ import datetime
 import asyncio
 import aiohttp
 import sqlite3
-from typing import Optional
+from typing import Optional, List, Tuple
+import os
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandObject
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    Message, CallbackQuery, ContentType
+    Message, CallbackQuery, ContentType, FSInputFile
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 
-# --- Ваши токены и ID ---
+# --- Ваши токены и ID --- (оставлены без изменений)
 API_TOKEN = "7655638672:AAFOopE1OW8vdWsXD7vkWCT6ajwG5EteD8Y"
 CRYPTOBOT_TOKEN = "465711:AAarYlqovxpBZzKvON1MBg5Vx967hLO7AyW"
 ADMIN_IDS = [7550144201]
@@ -96,8 +99,7 @@ db_init()
 class Form(StatesGroup):
     admin_broadcast = State()
     admin_set_card = State()
-    admin_set_balance = State()
-    admin_grant_sub = State()
+
     report_waiting_target = State()
     report_waiting_proof = State()
 
@@ -126,7 +128,7 @@ def update_user_subscription(user_id: int, sub_end: Optional[str]=None, whitelis
     c = conn.cursor()
     if sub_end:
         c.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (sub_end, user_id))
-    if whitelist_end:
+    if whitelist_end is not None:
         c.execute("UPDATE users SET whitelist_end = ? WHERE user_id = ?", (whitelist_end, user_id))
     conn.commit()
     conn.close()
@@ -159,6 +161,14 @@ def set_card_text(text: str):
     c.execute("UPDATE card_info SET card_text = ? WHERE id = 1", (text,))
     conn.commit()
     conn.close()
+
+def get_referrals_count(user_id: int) -> int:
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) AS cnt FROM users WHERE referrer = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return int(row["cnt"] if row else 0)
 
 # --- Платежи (БД) ---
 def create_payment(payment_id: str, user_id: int, days: int, price_rub: float, price_usd: float, pay_type: str, invoice_id: Optional[str]=None):
@@ -223,9 +233,10 @@ def main_menu():
     return kb
 
 def admin_menu():
+    # Убраны «Баланс пользователя» и «Выдать тариф». Добавлена «Статистика (PDF)».
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast"), InlineKeyboardButton(text="🧾 Баланс пользователя", callback_data="admin_balance")],
-        [InlineKeyboardButton(text="💳 Изменить данные карты", callback_data="admin_set_card"), InlineKeyboardButton(text="🎁 Выдать тариф", callback_data="admin_grant_sub")],
+        [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast"), InlineKeyboardButton(text="💳 Изменить данные карты", callback_data="admin_set_card")],
+        [InlineKeyboardButton(text="📊 Статистика (PDF)", callback_data="admin_stats_pdf")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
     ])
     return kb
@@ -252,19 +263,33 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data == "profile")
 async def cb_profile(cb: CallbackQuery):
     user = get_user(cb.from_user.id)
-    balance = user["balance"] if user else 0.0
-    sub = user["subscription_end"] if user else None
-    whitelist = user["whitelist_end"] if user else None
-    ref = user["referrer"] if user else 0
+    sub_end = user["subscription_end"] if user else None
+    reg = user["registration_date"] if user else None
+    uname = (user["username"] if user else cb.from_user.username) or "-"
+    refs = get_referrals_count(cb.from_user.id)
+
+    # Красивое форматирование профиля без баланса/вайтлиста
+    def human_sub_status(sub: Optional[str]) -> str:
+        if not sub:
+            return "Нет"
+        try:
+            dt = datetime.datetime.strptime(sub, "%Y-%m-%d %H:%M:%S")
+            if dt >= datetime.datetime.now():
+                days_left = (dt - datetime.datetime.now()).days
+                return f"Активна до <b>{dt:%d.%m.%Y %H:%M}</b> (осталось ≈ {max(days_left,0)} дн.)"
+            else:
+                return f"Истекла <b>{dt:%d.%m.%Y %H:%M}</b>"
+        except Exception:
+            return sub
+
     text = (
-        f"👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{cb.from_user.id}</code>\n"
-        f"Имя: {user['name'] if user else cb.from_user.first_name}\n"
-        f"Юзернейм: @{(user['username'] if user else cb.from_user.username) or '-'}\n"
-        f"Баланс (RUB): {balance:.2f}\n"
-        f"Реферал: {ref if ref else '-'}\n"
-        f"Подписка: {sub if sub else 'Нет'}\n"
-        f"Вайтлист: {whitelist if whitelist else 'Нет'}\n"
+        "👤 <b>Профиль</b>\n\n"
+        f"🆔 ID: <code>{cb.from_user.id}</code>\n"
+        f"👤 Имя: {user['name'] if user else cb.from_user.first_name}\n"
+        f"🔗 Юзернейм: @{uname}\n"
+        f"📅 Регистрация: {reg or '—'}\n"
+        f"💼 Подписка: {human_sub_status(sub_end)}\n"
+        f"👥 Количество рефералов: <b>{refs}</b>\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Меню", callback_data="menu")]])
     if cb.from_user.id in ADMIN_IDS:
@@ -274,18 +299,17 @@ async def cb_profile(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "referrals")
 async def cb_referrals(cb: CallbackQuery):
-    user = get_user(cb.from_user.id)
-    balance = user["balance"] if user else 0.0
     try:
         me = await bot.get_me()
         bot_username = me.username or "your_bot"
     except Exception:
         bot_username = "your_bot"
     link = f"https://t.me/{bot_username}?start={cb.from_user.id}"
+    refs = get_referrals_count(cb.from_user.id)
     text = (
         "👥 <b>Реферальная программа</b>\n\n"
-        f"🔗 Ссылка: {link}\n"
-        f"💰 Баланс: {balance:.2f} RUB\n"
+        f"🔗 Ваша ссылка: {link}\n"
+        f"👥 Приведено пользователей: <b>{refs}</b>\n"
         "📈 За каждого оплатившего друга вы получаете 10% от его платежа."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Меню", callback_data="menu")]])
@@ -439,7 +463,7 @@ async def cb_pay_card(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer()
 
-# --- Админка ---
+# --- Админка: рассылка и изменение карты ---
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS:
@@ -487,44 +511,116 @@ async def msg_admin_set_card(message: Message, state: FSMContext):
     await message.answer("Данные карты обновлены.")
     await state.clear()
 
-@dp.callback_query(F.data == "admin_balance")
-async def cb_admin_balance(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id not in ADMIN_IDS:
-        await cb.answer("Доступ только для админов", show_alert=True)
-        return
-    await state.set_state(Form.admin_set_balance)
-    await safe_edit(cb.message.chat.id, cb.message.message_id, "Отправьте ID пользователя для просмотра баланса.")
-    await cb.answer()
+# --- Статистика (PDF) ---
+def _fetch_users_for_stats() -> Tuple[List[sqlite3.Row], List[sqlite3.Row]]:
+    """Возвращает (users_with_active_sub, other_users)"""
+    conn = db_connect(); c = conn.cursor()
+    # Активная подписка: дата >= сейчас
+    c.execute(
+        """
+        SELECT * FROM users
+        WHERE subscription_end IS NOT NULL AND subscription_end <> '' AND subscription_end >= datetime('now')
+        ORDER BY datetime(subscription_end) DESC
+        """
+    )
+    with_sub = c.fetchall()
 
-@dp.message(Form.admin_set_balance, F.text)
-async def msg_admin_set_balance(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ только для админов")
-        await state.clear()
-        return
+    c.execute(
+        """
+        SELECT * FROM users
+        WHERE (subscription_end IS NULL OR subscription_end = '' OR subscription_end < datetime('now'))
+        ORDER BY datetime(registration_date) DESC
+        """
+    )
+    others = c.fetchall()
+    conn.close()
+    return with_sub, others
+
+def _build_stats_lines(group_title: str, rows: List[sqlite3.Row]) -> List[str]:
+    lines = [group_title]
+    if not rows:
+        lines.append("  — нет данных —")
+        return lines
+    for i, r in enumerate(rows, start=1):
+        uid = r["user_id"]
+        nm = r["name"] or "-"
+        un = (r["username"] or "-")
+        reg = r["registration_date"] or "-"
+        sub = r["subscription_end"] or "-"
+        lines.append(f"{i}. ID:{uid} | {nm} (@{un}) | Рег: {reg} | Подписка до: {sub}")
+    return lines
+
+def generate_stats_pdf(filename: str) -> bool:
+    """Создаёт PDF. Возвращает True/False, удалось ли построить."""
+    with_sub, others = _fetch_users_for_stats()
+    header = [
+        "Статистика бота",
+        f"Сгенерировано: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+        "",
+    ]
+    part1 = _build_stats_lines("[Пользователи с активной подпиской]", with_sub)
+    part2 = _build_stats_lines("[Остальные пользователи]", others)
+    all_lines = header + part1 + [""] + part2
+
+    # 1) Попытка через fpdf (fpdf2)
     try:
-        uid = int(message.text.strip())
-    except Exception:
-        await message.answer("Нужно число — ID пользователя.")
-        return
-    user = get_user(uid)
-    if not user:
-        await message.answer("Пользователь не найден.")
-        await state.clear()
-        return
-    await message.answer(f"Баланс пользователя {uid}: {user['balance']:.2f} RUB")
-    await state.clear()
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_font("Arial", size=12)
+        for line in all_lines:
+            pdf.multi_cell(0, 8, txt=line)
+        pdf.output(filename)
+        return True
+    except Exception as e:
+        logger.warning("FPDF недоступен или ошибка генерации: %s", e)
 
-@dp.callback_query(F.data == "admin_grant_sub")
-async def cb_admin_grant_sub(cb: CallbackQuery, state: FSMContext):
+    # 2) Попытка через reportlab
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+
+        c = canvas.Canvas(filename, pagesize=A4)
+        width, height = A4
+        x_margin, y_margin = 15 * mm, 15 * mm
+        y = height - y_margin
+        c.setFont("Helvetica", 12)
+        for line in all_lines:
+            if y < y_margin:
+                c.showPage(); c.setFont("Helvetica", 12); y = height - y_margin
+            c.drawString(x_margin, y, line)
+            y -= 14
+        c.save()
+        return True
+    except Exception as e:
+        logger.error("ReportLab недоступен или ошибка генерации: %s", e)
+        return False
+
+@dp.callback_query(F.data == "admin_stats_pdf")
+async def cb_admin_stats_pdf(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
         await cb.answer("Доступ только для админов", show_alert=True)
         return
-    await state.set_state(Form.admin_grant_sub)
-    await safe_edit(cb.message.chat.id, cb.message.message_id, "Режим выдачи тарифа активирован. Отправьте: <user_id> <days> (например: 123456 30)")
-    await bot.send_message(cb.message.chat.id, "Введите данные в формате: <user_id> <days> (например: 123456 30). Если вы в группе и бот не реагирует, перейдите в ЛС и отправьте команду /grant <user_id> <days>.")
+    fname = f"bot_stats_{int(datetime.datetime.now().timestamp())}.pdf"
+    ok = generate_stats_pdf(fname)
+    if ok and os.path.exists(fname):
+        try:
+            await bot.send_document(cb.message.chat.id, FSInputFile(fname), caption="Статистика бота (PDF)")
+        finally:
+            try:
+                os.remove(fname)
+            except Exception:
+                pass
+    else:
+        await cb.message.answer(
+            "Не удалось сформировать PDF. Установите одну из библиотек на сервере: \n"
+            "• pip install fpdf2\n• pip install reportlab"
+        )
     await cb.answer()
 
+# --- Report («Снести Жертву») ---
 @dp.callback_query(F.data == "report_user")
 async def cb_report_user(cb: CallbackQuery, state: FSMContext):
     user = get_user(cb.from_user.id)
@@ -571,12 +667,12 @@ async def msg_report_proof(message: Message, state: FSMContext):
         logger.error("Failed to forward report: %s", e)
     update_last_action_ts(message.from_user.id)
     await message.answer("Репорт отправлен админам. Ожидайте ответа.", reply_markup=main_menu())
-    # Прогресс-бар
+    # Прогресс-бар (визуальный)
     progress_msg = await message.answer("Начинается операция...\n[▒▒▒▒▒▒▒▒▒▒] 0%")
     steps = 10
-    for i in range(1, steps+1):
+    for i in range(1, steps + 1):
         bar = "█" * i + "▒" * (steps - i)
-        percent = int(i/steps*100)
+        percent = int(i / steps * 100)
         try:
             await bot.edit_message_text(chat_id=progress_msg.chat.id, message_id=progress_msg.message_id, text=f"[{bar}] {percent}%")
         except Exception:
@@ -585,14 +681,21 @@ async def msg_report_proof(message: Message, state: FSMContext):
     await bot.edit_message_text(chat_id=progress_msg.chat.id, message_id=progress_msg.message_id, text="✅ Операция завершена, ожидайте обратной связи от админов.")
     await state.clear()
 
+# --- Информация ---
+@dp.callback_query(F.data == "info")
+async def cb_info(cb: CallbackQuery):
+    info_text = (
+        "ℹ️ <b>Информация</b>\n\n"
+        "Поддержка — @HarikCVV\n"
+        "Отзывы — @RepHarik"
+    )
+    await safe_edit(cb.message.chat.id, cb.message.message_id, info_text, main_menu())
+    await cb.answer()
+
+# --- Меню и прочее ---
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
     await safe_edit(cb.message.chat.id, cb.message.message_id, "Главное меню:", main_menu())
-    await cb.answer()
-
-@dp.callback_query(F.data == "info")
-async def cb_info(cb: CallbackQuery):
-    await safe_edit(cb.message.chat.id, cb.message.message_id, "Поддержка - @HarikCVV", main_menu())
     await cb.answer()
 
 # --- Безопасная правка сообщения ---
@@ -606,32 +709,7 @@ async def safe_edit(chat_id: int, message_id: int, text: str, reply_markup: Opti
             return
         logger.warning("safe_edit error: %s", e)
 
-# --- Запуск ---
-
-
-# --- Надёжные хэндлеры для выдачи тарифа ---
-@dp.message(Form.admin_grant_sub)
-async def msg_admin_grant_sub(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ только для админов")
-        await state.clear()
-        return
-    parts = message.text.strip().split()
-    if len(parts) != 2:
-        await message.answer("Формат: <user_id> <days>")
-        return
-    try:
-        uid = int(parts[0]); days = int(parts[1])
-    except Exception:
-        await message.answer("Неверные данные.")
-        return
-    now = datetime.datetime.now()
-    end = now + datetime.timedelta(days=days) if days < 9999 else now + datetime.timedelta(days=36500)
-    update_user_subscription(uid, end.strftime("%Y-%m-%d %H:%M:%S"))
-    await message.answer(f"✅ Пользователю {uid} выдан тариф на {days} дн. До: {end.strftime('%Y-%m-%d %H:%M:%S')}")
-    await state.clear()
-
-
+# --- Выдача тарифа — только по команде ---
 @dp.message(F.text.startswith("/grant"))
 async def cmd_grant_simple(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -651,9 +729,9 @@ async def cmd_grant_simple(message: Message):
     update_user_subscription(uid, end.strftime("%Y-%m-%d %H:%M:%S"))
     await message.reply(f"✅ Пользователю {uid} выдан тариф на {days} дн. До: {end.strftime('%Y-%m-%d %H:%M:%S')}")
 
-
+# --- Запуск ---
 async def main():
-    logger.info("Bot started (safe mode)")
+    logger.info("Bot started (updated)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
